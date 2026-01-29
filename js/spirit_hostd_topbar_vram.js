@@ -4,9 +4,12 @@ import { api } from "../../scripts/api.js";
 const STYLE_ID = "spirit-vram-topbar-style";
 const POS_KEY = "spirit.vram.topbar.pos.v1";
 
-// If your backend routes differ, adjust these two:
+// Backend routes
 const SHED_PATH = "/spirit/vram/shed";
 const RESTORE_PATH = "/spirit/vram/restore";
+
+// New: status route (you’ll add this in spirit_web.py below)
+const STATUS_PATH = "/spirit/vram/status";
 
 function ensureStyles() {
   if (document.getElementById(STYLE_ID)) return;
@@ -41,17 +44,20 @@ function ensureStyles() {
       cursor: pointer;
       font-size: 12px;
       line-height: 18px;
-      transition: background 120ms ease, border-color 120ms ease, transform 60ms ease;
+      transition: background 120ms ease, border-color 120ms ease, transform 60ms ease, color 120ms ease;
     }
 
+    /* Requested cosmetics */
     #spirit-vram-topbar .spirit-vram-btn:hover {
-      background: rgba(255,255,255,0.12);
-      border-color: rgba(255,255,255,0.24);
+      background: #64b5f6;
+      border-color: #64b5f6;
+      color: #0b1a24;
     }
 
     #spirit-vram-topbar .spirit-vram-btn:active {
-      background: rgba(255,255,255,0.16);
-      border-color: rgba(255,255,255,0.28);
+      background: #42a5f5;
+      border-color: #42a5f5;
+      color: #0b1a24;
       transform: translateY(1px);
     }
 
@@ -66,12 +72,32 @@ function ensureStyles() {
       opacity: 0.85;
       padding-left: 6px;
       white-space: nowrap;
-      max-width: 340px;
+      max-width: 240px;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
-    /* mimic workspace-manager: handle hidden until hover */
+    /* New: restore-available indicator */
+    #spirit-vram-topbar .spirit-vram-ind {
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.06);
+      opacity: 0.9;
+      white-space: nowrap;
+    }
+
+    #spirit-vram-topbar .spirit-vram-ind.ready {
+      border-color: rgba(100, 181, 246, 0.9);
+      background: rgba(100, 181, 246, 0.18);
+    }
+
+    #spirit-vram-topbar .spirit-vram-ind.off {
+      opacity: 0.65;
+    }
+
+    /* handle hidden until hover */
     #spirit-vram-topbar .spirit-vram-handle {
       display: none;
       margin-left: 4px;
@@ -157,6 +183,22 @@ async function postJson(path, payload) {
   return data;
 }
 
+async function getJson(path) {
+  const res = await api.fetchApi(path, { method: "GET" });
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const msg = typeof data === "string" ? data : (data?.error || data?.message || res.statusText);
+    throw new Error(msg);
+  }
+  return data;
+}
+
 function makeDragHandleSvg() {
   const ns = "http://www.w3.org/2000/svg";
   const svg = document.createElementNS(ns, "svg");
@@ -171,7 +213,6 @@ function makeDragHandleSvg() {
   svg.classList.add("spirit-vram-handle");
   svg.setAttribute("title", "Drag");
 
-  // same "6 dots" pattern as workspace-manager’s handle vibe
   const circles = [
     "9 5", "9 12", "9 19",
     "15 5", "15 12", "15 19",
@@ -190,7 +231,6 @@ app.registerExtension({
   name: "spirit.hostd.topbar.vram",
   async setup() {
     ensureStyles();
-
     if (document.getElementById("spirit-vram-topbar")) return;
 
     const root = document.createElement("div");
@@ -210,6 +250,11 @@ app.registerExtension({
     statusEl.className = "spirit-vram-status";
     statusEl.textContent = "idle";
 
+    // New indicator pill
+    const indEl = document.createElement("div");
+    indEl.className = "spirit-vram-ind off";
+    indEl.textContent = "restore: ?";
+
     const divider = document.createElement("div");
     divider.className = "spirit-vram-divider";
 
@@ -218,11 +263,12 @@ app.registerExtension({
     root.appendChild(shedBtn);
     root.appendChild(restoreBtn);
     root.appendChild(statusEl);
+    root.appendChild(indEl);
     root.appendChild(divider);
     root.appendChild(handleSvg);
     document.body.appendChild(root);
 
-    // Positioning (default top-right, but persisted after drag)
+    // Positioning
     let pos = loadPos();
     const place = () => {
       const rect = root.getBoundingClientRect();
@@ -245,13 +291,54 @@ app.registerExtension({
       savePos(pos);
     });
 
-    // Actions
     const setStatus = (s) => { statusEl.textContent = s; };
     const setBusy = (busy) => {
       shedBtn.disabled = busy;
-      restoreBtn.disabled = busy;
+      // restoreBtn enabled/disabled is also controlled by restore-availability state,
+      // so we only force-disable it while busy:
+      if (busy) restoreBtn.disabled = true;
     };
 
+    const setRestoreIndicator = (canRestore, count, sourceLabel) => {
+      if (canRestore) {
+        indEl.classList.remove("off");
+        indEl.classList.add("ready");
+        indEl.textContent = `restore: ready${typeof count === "number" ? ` (${count})` : ""}`;
+        restoreBtn.disabled = false;
+        restoreBtn.title = "Restore containers stopped by shed";
+      } else {
+        indEl.classList.remove("ready");
+        indEl.classList.add("off");
+        indEl.textContent = `restore: no`;
+        restoreBtn.disabled = true;
+        restoreBtn.title = "No shed state to restore";
+      }
+      if (sourceLabel) indEl.title = `source: ${sourceLabel}`;
+    };
+
+    // Poll backend for state file presence
+    const refreshRestoreState = async () => {
+      try {
+        const data = await getJson(STATUS_PATH);
+        const can = !!data?.can_restore;
+        const cnt = typeof data?.stopped_count === "number" ? data.stopped_count : undefined;
+        setRestoreIndicator(can, cnt, "server");
+      } catch {
+        // If status endpoint isn’t present yet, leave restore enabled (script is safe),
+        // but show unknown.
+        indEl.classList.remove("ready");
+        indEl.classList.add("off");
+        indEl.textContent = "restore: ?";
+        indEl.title = "source: none (add /spirit/vram/status)";
+        restoreBtn.disabled = false;
+      }
+    };
+
+    // Do an initial check and then keep it fresh
+    await refreshRestoreState();
+    const statusTimer = window.setInterval(refreshRestoreState, 5000);
+
+    // Actions
     shedBtn.addEventListener("click", async () => {
       setBusy(true);
       setStatus("shedding…");
@@ -262,6 +349,7 @@ app.registerExtension({
         setStatus(`error: ${e?.message || e}`);
       } finally {
         setBusy(false);
+        await refreshRestoreState();
       }
     });
 
@@ -275,10 +363,11 @@ app.registerExtension({
         setStatus(`error: ${e?.message || e}`);
       } finally {
         setBusy(false);
+        await refreshRestoreState();
       }
     });
 
-    // Dragging (handle-only), workspace-manager style: translate while dragging, commit on end
+    // Dragging (handle-only)
     let dragging = false;
     let startX = 0;
     let startY = 0;
@@ -342,11 +431,15 @@ app.registerExtension({
       window.addEventListener("pointercancel", endDrag);
     });
 
-    // Optional: double-click handle to reset position
     handleSvg.addEventListener("dblclick", () => {
       localStorage.removeItem(POS_KEY);
       pos = null;
       place();
+    });
+
+    // If ComfyUI hot-reloads extensions, avoid orphaned intervals
+    window.addEventListener("beforeunload", () => {
+      window.clearInterval(statusTimer);
     });
   },
 });

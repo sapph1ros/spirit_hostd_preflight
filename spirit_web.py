@@ -65,6 +65,18 @@ def _call_hostd(action: str, args: dict, wait: bool = True) -> tuple[int, dict]:
 
 routes = PromptServer.instance.routes
 
+STATE_FILE = os.environ.get("GPU_SHED_STATE_FILE", "/run/gpu-shed.stopped")
+
+def _read_shed_state() -> list[str]:
+  if not os.path.exists(STATE_FILE):
+    return []
+  try:
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+      lines = [ln.strip() for ln in f.readlines()]
+    return [ln for ln in lines if ln]
+  except Exception:
+    return []
+
 @routes.post("/spirit/vram/shed")
 async def spirit_vram_shed(request):
   body = {}
@@ -104,3 +116,19 @@ async def spirit_vram_restore(request):
   }, wait=wait)
 
   return web.json_response(resp, status=200 if code == 200 else 500)
+
+@routes.get("/spirit/vram/status")
+async def spirit_vram_status(request):
+  stopped = _read_shed_state()
+  state_exists = os.path.exists(STATE_FILE)
+
+  # restore is available if file exists AND has at least one container name
+  can_restore = len(stopped) > 0
+
+  return web.json_response({
+    "can_restore": can_restore,
+    "stopped_count": len(stopped),
+    "stopped": stopped,
+    "state_file_exists": state_exists,
+    "state_file": STATE_FILE,
+  }, status=200)
