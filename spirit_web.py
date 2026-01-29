@@ -122,8 +122,8 @@ async def spirit_vram_status(request):
   stopped = _read_shed_state()
   state_exists = os.path.exists(STATE_FILE)
 
-  # restore is available if file exists AND has at least one container name
-  can_restore = len(stopped) > 0
+  # restore is available if a shed state exists (even if no containers were stopped)
+  can_restore = state_exists
 
   return web.json_response({
     "can_restore": can_restore,
