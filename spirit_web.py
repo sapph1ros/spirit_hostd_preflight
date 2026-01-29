@@ -65,7 +65,7 @@ def _call_hostd(action: str, args: dict, wait: bool = True) -> tuple[int, dict]:
 
 routes = PromptServer.instance.routes
 
-STATE_FILE = os.environ.get("GPU_SHED_STATE_FILE", "/run/gpu-shed.stopped")
+STATE_FILE = os.environ.get("GPU_SHED_STATE_FILE", "/hostd/gpu-shed.stopped")
 
 def _read_shed_state() -> list[str]:
   if not os.path.exists(STATE_FILE):
