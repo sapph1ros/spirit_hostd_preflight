@@ -1,43 +1,38 @@
-import { app } from "../../scripts/app.js"
-import { api } from "../../scripts/api.js"
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms))
-}
+const STYLE_ID = "spirit-vram-topbar-style";
+const POS_KEY = "spirit.vram.topbar.pos.v1";
 
-function isVisible(el) {
-  if (!el) return false
-  const cs = getComputedStyle(el)
-  if (cs.display === "none") return false
-  if (cs.visibility === "hidden") return false
-  if (cs.opacity === "0") return false
-  if (el.getClientRects().length === 0) return false
-  return true
-}
+// If your backend routes differ, adjust these two:
+const SHED_PATH = "/spirit/vram/shed";
+const RESTORE_PATH = "/spirit/vram/restore";
 
 function ensureStyles() {
-  if (document.getElementById("spirit-vram-topbar-style")) return
-  const style = document.createElement("style")
-  style.id = "spirit-vram-topbar-style"
+  if (document.getElementById(STYLE_ID)) return;
+
+  const style = document.createElement("style");
+  style.id = STYLE_ID;
   style.textContent = `
     #spirit-vram-topbar {
       display: inline-flex;
       align-items: center;
       gap: 6px;
       padding: 4px 8px;
-      border: 1px solid rgba(255,255,255,0.15);
+      border: 1px solid var(--interface-stroke, rgba(255,255,255,0.15));
       border-radius: 8px;
       user-select: none;
       pointer-events: auto;
-    }
-    #spirit-vram-topbar.spirit-floating {
-      position: fixed;
-      top: 10px;
-      right: 12px;
-      z-index: 999999;
-      background: rgba(0,0,0,0.35);
+      background: var(--comfy-menu-bg, rgba(0,0,0,0.35));
+      box-shadow: var(--interface-panel-drop-shadow, 0 4px 14px rgba(0,0,0,0.35));
       backdrop-filter: blur(6px);
     }
+
+    #spirit-vram-topbar.spirit-floating {
+      position: fixed;
+      z-index: 99999;
+    }
+
     #spirit-vram-topbar .spirit-vram-btn {
       padding: 4px 10px;
       border-radius: 6px;
@@ -46,11 +41,26 @@ function ensureStyles() {
       cursor: pointer;
       font-size: 12px;
       line-height: 18px;
+      transition: background 120ms ease, border-color 120ms ease, transform 60ms ease;
     }
+
+    #spirit-vram-topbar .spirit-vram-btn:hover {
+      background: rgba(255,255,255,0.12);
+      border-color: rgba(255,255,255,0.24);
+    }
+
+    #spirit-vram-topbar .spirit-vram-btn:active {
+      background: rgba(255,255,255,0.16);
+      border-color: rgba(255,255,255,0.28);
+      transform: translateY(1px);
+    }
+
     #spirit-vram-topbar .spirit-vram-btn:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+      transform: none;
     }
+
     #spirit-vram-topbar .spirit-vram-status {
       font-size: 12px;
       opacity: 0.85;
@@ -60,127 +70,283 @@ function ensureStyles() {
       overflow: hidden;
       text-overflow: ellipsis;
     }
-  `
-  document.head.appendChild(style)
+
+    /* mimic workspace-manager: handle hidden until hover */
+    #spirit-vram-topbar .spirit-vram-handle {
+      display: none;
+      margin-left: 4px;
+      cursor: move;
+      opacity: 0.95;
+    }
+
+    #spirit-vram-topbar:hover .spirit-vram-handle {
+      display: inline-block;
+    }
+
+    #spirit-vram-topbar .spirit-vram-divider {
+      width: 1px;
+      height: 16px;
+      background: rgba(255,255,255,0.18);
+      margin-left: 4px;
+    }
+
+    #spirit-vram-topbar.spirit-dragging {
+      cursor: move;
+    }
+  `;
+  document.head.appendChild(style);
 }
 
-async function postJson(path, obj) {
+function loadPos() {
+  try {
+    const raw = localStorage.getItem(POS_KEY);
+    if (!raw) return null;
+    const pos = JSON.parse(raw);
+    if (typeof pos?.x !== "number" || typeof pos?.y !== "number") return null;
+    return pos;
+  } catch {
+    return null;
+  }
+}
+
+function savePos(pos) {
+  try {
+    localStorage.setItem(POS_KEY, JSON.stringify(pos));
+  } catch {
+    // ignore
+  }
+}
+
+function clampPos(pos, width, height) {
+  const pad = 8;
+  const maxX = Math.max(pad, window.innerWidth - width - pad);
+  const maxY = Math.max(pad, window.innerHeight - height - pad);
+  return {
+    x: Math.min(Math.max(pos.x, pad), maxX),
+    y: Math.min(Math.max(pos.y, pad), maxY),
+  };
+}
+
+function applyPos(el, pos) {
+  el.style.left = `${pos.x}px`;
+  el.style.top = `${pos.y}px`;
+  el.style.right = "auto";
+  el.style.bottom = "auto";
+}
+
+async function postJson(path, payload) {
   const res = await api.fetchApi(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(obj ?? {})
-  })
-  const data = await res.json().catch(() => ({}))
-  return { ok: res.ok, status: res.status, data }
-}
+    body: JSON.stringify(payload ?? {}),
+  });
 
-async function waitForVisibleActionbar() {
-  // This is the *new* topbar container in your pasted HTML.
-  for (let i = 0; i < 200; i++) {
-    const bar = document.querySelector(".actionbar-container")
-    if (isVisible(bar)) return bar
-    await sleep(50)
-  }
-  return null
-}
-
-function pickDockContainer(actionbar) {
-  // In your HTML, the "nice" row of buttons/monitors sits under a flex container with mx-2.
-  // If that changes, we fall back to the actionbar itself.
-  const row = actionbar.querySelector(".flex.gap-2.mx-2")
-  if (isVisible(row)) return row
-  return actionbar
-}
-
-function buildOrRebuildRoot(root) {
-  root.innerHTML = ""
-
-  const shedBtn = document.createElement("button")
-  shedBtn.className = "spirit-vram-btn"
-  shedBtn.textContent = "VRAM: SHED"
-
-  const restoreBtn = document.createElement("button")
-  restoreBtn.className = "spirit-vram-btn"
-  restoreBtn.textContent = "VRAM: RESTORE"
-
-  const status = document.createElement("div")
-  status.className = "spirit-vram-status"
-  status.textContent = "idle"
-
-  async function run(kind) {
-    shedBtn.disabled = true
-    restoreBtn.disabled = true
-    status.textContent = `running: ${kind}…`
-    try {
-      let r = null
-      if (kind === "shed") {
-        r = await postJson("/spirit/vram/shed", {
-          args: { protect: "comfyui", high_only: true, quiet: true, wait: true }
-        })
-      } else {
-        r = await postJson("/spirit/vram/restore", {
-          args: { quiet: true, wait: true }
-        })
-      }
-      status.textContent = r.ok ? "ok" : `failed (${r.status})`
-    } catch (e) {
-      status.textContent = `error: ${e?.message || e}`
-    } finally {
-      shedBtn.disabled = false
-      restoreBtn.disabled = false
-    }
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
   }
 
-  shedBtn.onclick = () => run("shed")
-  restoreBtn.onclick = () => run("restore")
+  if (!res.ok) {
+    const msg = typeof data === "string" ? data : (data?.error || data?.message || res.statusText);
+    throw new Error(msg);
+  }
 
-  root.appendChild(shedBtn)
-  root.appendChild(restoreBtn)
-  root.appendChild(status)
+  return data;
+}
+
+function makeDragHandleSvg() {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("width", "15");
+  svg.setAttribute("height", "15");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.classList.add("spirit-vram-handle");
+  svg.setAttribute("title", "Drag");
+
+  // same "6 dots" pattern as workspace-manager’s handle vibe
+  const circles = [
+    "9 5", "9 12", "9 19",
+    "15 5", "15 12", "15 19",
+  ];
+  for (const c of circles) {
+    const [x, y] = c.split(" ").map(Number);
+    const p = document.createElementNS(ns, "path");
+    p.setAttribute("d", `M${x} ${y}m-1 0a1 1 0 1 0 2 0a1 1 0 1 0 -2 0`);
+    svg.appendChild(p);
+  }
+
+  return svg;
 }
 
 app.registerExtension({
-  // (optional) bumping the name helps if the old extension is cached weirdly
   name: "spirit.hostd.topbar.vram",
-
   async setup() {
-    ensureStyles()
+    ensureStyles();
 
-    console.log("[spirit.hostd.topbar.vram] setup() running")
+    if (document.getElementById("spirit-vram-topbar")) return;
 
-    // Reuse existing element if it already exists (even if it’s stuck in hidden legacy menu)
-    let root = document.getElementById("spirit-vram-topbar")
-    if (!root) {
-      root = document.createElement("div")
-      root.id = "spirit-vram-topbar"
-    }
+    const root = document.createElement("div");
+    root.id = "spirit-vram-topbar";
+    root.classList.add("spirit-floating");
+    root.style.visibility = "hidden";
 
-    buildOrRebuildRoot(root)
+    const shedBtn = document.createElement("button");
+    shedBtn.className = "spirit-vram-btn";
+    shedBtn.textContent = "VRAM: SHED";
 
-    // Always force a visible fallback first
-    root.classList.add("spirit-floating")
-    if (root.parentElement !== document.body) {
-      document.body.appendChild(root)
-    }
+    const restoreBtn = document.createElement("button");
+    restoreBtn.className = "spirit-vram-btn";
+    restoreBtn.textContent = "VRAM: RESTORE";
 
-    // Then try to dock into the new action bar
-    const actionbar = await waitForVisibleActionbar()
-    if (!actionbar) {
-      console.warn("[spirit.hostd.topbar.vram] actionbar not found, staying floating")
-      return
-    }
+    const statusEl = document.createElement("div");
+    statusEl.className = "spirit-vram-status";
+    statusEl.textContent = "idle";
 
-    const dock = pickDockContainer(actionbar)
+    const divider = document.createElement("div");
+    divider.className = "spirit-vram-divider";
 
-    // If it’s already docked, do nothing; otherwise move it
-    if (root.parentElement !== dock) {
-      dock.appendChild(root)
-    }
+    const handleSvg = makeDragHandleSvg();
 
-    // When docked, remove floating positioning
-    root.classList.remove("spirit-floating")
-    root.style.marginRight = "8px"
+    root.appendChild(shedBtn);
+    root.appendChild(restoreBtn);
+    root.appendChild(statusEl);
+    root.appendChild(divider);
+    root.appendChild(handleSvg);
+    document.body.appendChild(root);
 
-    console.log("[spirit.hostd.topbar.vram] docked into actionbar")
-  }
-})
+    // Positioning (default top-right, but persisted after drag)
+    let pos = loadPos();
+    const place = () => {
+      const rect = root.getBoundingClientRect();
+      if (!pos) {
+        pos = {
+          x: window.innerWidth - rect.width - 12,
+          y: 10,
+        };
+      }
+      pos = clampPos(pos, rect.width, rect.height);
+      applyPos(root, pos);
+      root.style.visibility = "visible";
+    };
+
+    requestAnimationFrame(place);
+    window.addEventListener("resize", () => {
+      const rect = root.getBoundingClientRect();
+      pos = clampPos(pos, rect.width, rect.height);
+      applyPos(root, pos);
+      savePos(pos);
+    });
+
+    // Actions
+    const setStatus = (s) => { statusEl.textContent = s; };
+    const setBusy = (busy) => {
+      shedBtn.disabled = busy;
+      restoreBtn.disabled = busy;
+    };
+
+    shedBtn.addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("shedding…");
+      try {
+        const data = await postJson(SHED_PATH, { wait: true, max_wait_seconds: 30 });
+        setStatus(data?.status || "shed done");
+      } catch (e) {
+        setStatus(`error: ${e?.message || e}`);
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    restoreBtn.addEventListener("click", async () => {
+      setBusy(true);
+      setStatus("restoring…");
+      try {
+        const data = await postJson(RESTORE_PATH, { wait: true, max_wait_seconds: 30 });
+        setStatus(data?.status || "restored");
+      } catch (e) {
+        setStatus(`error: ${e?.message || e}`);
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    // Dragging (handle-only), workspace-manager style: translate while dragging, commit on end
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let dx = 0;
+    let dy = 0;
+    let base = { x: 0, y: 0 };
+
+    const onMove = (ev) => {
+      if (!dragging) return;
+      dx = ev.clientX - startX;
+      dy = ev.clientY - startY;
+      root.style.transform = `translate(${dx}px, ${dy}px)`;
+    };
+
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+
+      root.classList.remove("spirit-dragging");
+      root.style.transform = "";
+
+      const rect = root.getBoundingClientRect();
+      const newPos = clampPos(
+        { x: base.x + dx, y: base.y + dy },
+        rect.width,
+        rect.height
+      );
+
+      pos = newPos;
+      applyPos(root, pos);
+      savePos(pos);
+
+      dx = 0;
+      dy = 0;
+
+      document.body.style.userSelect = "";
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", endDrag);
+      window.removeEventListener("pointercancel", endDrag);
+    };
+
+    handleSvg.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+
+      const left = parseFloat(root.style.left || "0");
+      const top = parseFloat(root.style.top || "0");
+
+      base = { x: Number.isFinite(left) ? left : 0, y: Number.isFinite(top) ? top : 0 };
+      startX = ev.clientX;
+      startY = ev.clientY;
+      dx = 0;
+      dy = 0;
+
+      dragging = true;
+      root.classList.add("spirit-dragging");
+      root.style.zIndex = "100000";
+      document.body.style.userSelect = "none";
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", endDrag);
+      window.addEventListener("pointercancel", endDrag);
+    });
+
+    // Optional: double-click handle to reset position
+    handleSvg.addEventListener("dblclick", () => {
+      localStorage.removeItem(POS_KEY);
+      pos = null;
+      place();
+    });
+  },
+});
