@@ -1,6 +1,7 @@
 import json
 import os
-import socket
+import urllib.request
+import urllib.error
 
 import folder_paths
 import nodes
@@ -8,49 +9,57 @@ import nodes
 from comfy_execution.graph import ExecutionBlocker
 
 
-def _unix_http_post_json(sock_path: str, path: str, payload: dict, timeout_s: float = 10.0) -> tuple[int, dict | None, str]:
+VRAM_MANAGER_URL = os.environ.get("VRAM_MANAGER_URL", "http://vram-manager:8100")
+
+
+def _http_post_json(url: str, payload: dict, timeout_s: float = 120.0) -> tuple[int, dict | None, str]:
+  """POST JSON to vram-manager and return (status_code, parsed_json, raw_body)."""
   body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-  req = (
-    f"POST {path} HTTP/1.1\r\n"
-    f"Host: localhost\r\n"
-    f"Content-Type: application/json\r\n"
-    f"Content-Length: {len(body)}\r\n"
-    f"Connection: close\r\n"
-    f"\r\n"
-  ).encode("utf-8") + body
-
-  with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-    s.settimeout(timeout_s)
-    s.connect(sock_path)
-    s.sendall(req)
-
-    chunks = []
-    while True:
-      try:
-        data = s.recv(65536)
-      except socket.timeout:
-        break
-      if not data:
-        break
-      chunks.append(data)
-
-  raw = b"".join(chunks).decode("utf-8", errors="replace")
-  head, _, resp_body = raw.partition("\r\n\r\n")
-  status_line = head.splitlines()[0] if head else ""
-  status_code = 0
+  req = urllib.request.Request(
+    url,
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+  )
   try:
-    status_code = int(status_line.split(" ")[1])
-  except Exception:
-    status_code = 0
-
-  resp_json = None
-  if resp_body.strip():
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      raw = resp.read().decode("utf-8")
+      try:
+        data = json.loads(raw)
+      except json.JSONDecodeError:
+        data = None
+      return resp.status, data, raw
+  except urllib.error.HTTPError as e:
+    raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
     try:
-      resp_json = json.loads(resp_body)
+      data = json.loads(raw)
     except Exception:
-      resp_json = None
+      data = None
+    return e.code, data, raw
+  except Exception as e:
+    return 0, None, str(e)
 
-  return status_code, resp_json, raw
+
+def _http_get_json(url: str, timeout_s: float = 10.0) -> tuple[int, dict | None, str]:
+  """GET JSON from vram-manager."""
+  req = urllib.request.Request(url, method="GET")
+  try:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      raw = resp.read().decode("utf-8")
+      try:
+        data = json.loads(raw)
+      except json.JSONDecodeError:
+        data = None
+      return resp.status, data, raw
+  except urllib.error.HTTPError as e:
+    raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
+    try:
+      data = json.loads(raw)
+    except Exception:
+      data = None
+    return e.code, data, raw
+  except Exception as e:
+    return 0, None, str(e)
 
 
 class SpiritHostdGpuShed:
@@ -61,10 +70,9 @@ class SpiritHostdGpuShed:
         "enabled": ("BOOLEAN", {"default": True}),
       },
       "optional": {
-        "hostd_socket": ("STRING", {"default": ""}),
+        "vram_manager_url": ("STRING", {"default": ""}),
         "protect": ("STRING", {"default": "comfyui"}),
         "high_only": ("BOOLEAN", {"default": True}),
-        "quiet": ("BOOLEAN", {"default": True}),
         "wait": ("BOOLEAN", {"default": True}),
         "strict": ("BOOLEAN", {"default": False}),
       }
@@ -78,32 +86,31 @@ class SpiritHostdGpuShed:
   def run(
     self,
     enabled: bool,
-    hostd_socket: str = "",
+    vram_manager_url: str = "",
     protect: str = "comfyui",
     high_only: bool = True,
-    quiet: bool = True,
     wait: bool = True,
     strict: bool = False
   ):
     if not enabled:
       return (True, "Preflight disabled")
 
-    sock_path = hostd_socket.strip() or os.environ.get("HOSTD_SOCK", "/hostd/hostd.sock")
-    path = "/v1/run?wait=1" if wait else "/v1/run"
+    base_url = (vram_manager_url.strip() or VRAM_MANAGER_URL).rstrip("/")
+
+    protect_list = [c.strip() for c in protect.split(",") if c.strip()]
 
     payload = {
-      "action": "gpu_shed.shed",
-      "args": {
-        "protect": protect,
-        "high_only": bool(high_only),
-        "quiet": bool(quiet),
-      }
+      "protect": protect_list,
+      "high_only": bool(high_only),
     }
 
-    code, resp_json, raw = _unix_http_post_json(sock_path, path, payload, timeout_s=30.0)
+    wait_param = "1" if wait else "0"
+    url = f"{base_url}/api/shed?wait={wait_param}"
+
+    code, resp_json, raw = _http_post_json(url, payload, timeout_s=120.0)
 
     ok = (code == 200) and isinstance(resp_json, dict) and resp_json.get("ok") is True
-    msg = f"hostd code={code}, resp={resp_json}"
+    msg = f"vram-manager code={code}, resp={resp_json}"
 
     if not ok and strict:
       raise RuntimeError(f"[SpiritHostdGpuShed] {msg}\nRaw response:\n{raw}")

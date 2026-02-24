@@ -1,6 +1,7 @@
 import json
 import os
-import socket
+import urllib.request
+import urllib.error
 
 from aiohttp import web
 from server import PromptServer
@@ -8,74 +9,61 @@ from server import PromptServer
 WEB_DIRECTORY = "./js"
 __all__ = ["WEB_DIRECTORY"]
 
-def _unix_http_post_json(sock_path: str, path: str, payload: dict, timeout_s: float = 120.0) -> tuple[int, dict | None, str]:
+VRAM_MANAGER_URL = os.environ.get("VRAM_MANAGER_URL", "http://vram-manager:8100")
+
+
+def _http_post_json(url: str, payload: dict, timeout_s: float = 120.0) -> tuple[int, dict | None, str]:
+  """POST JSON to vram-manager."""
   body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-  req = (
-    f"POST {path} HTTP/1.1\r\n"
-    f"Host: localhost\r\n"
-    f"Content-Type: application/json\r\n"
-    f"Content-Length: {len(body)}\r\n"
-    f"Connection: close\r\n"
-    f"\r\n"
-  ).encode("utf-8") + body
-
-  with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-    s.settimeout(timeout_s)
-    s.connect(sock_path)
-    s.sendall(req)
-
-    chunks = []
-    while True:
-      try:
-        data = s.recv(65536)
-      except socket.timeout:
-        break
-      if not data:
-        break
-      chunks.append(data)
-
-  raw = b"".join(chunks).decode("utf-8", errors="replace")
-  head, _, resp_body = raw.partition("\r\n\r\n")
-  status_line = head.splitlines()[0] if head else ""
-  code = 0
+  req = urllib.request.Request(
+    url,
+    data=body,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+  )
   try:
-    code = int(status_line.split(" ")[1])
-  except Exception:
-    code = 0
-
-  resp_json = None
-  if resp_body.strip():
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      raw = resp.read().decode("utf-8")
+      try:
+        data = json.loads(raw)
+      except json.JSONDecodeError:
+        data = None
+      return resp.status, data, raw
+  except urllib.error.HTTPError as e:
+    raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
     try:
-      resp_json = json.loads(resp_body)
+      data = json.loads(raw)
     except Exception:
-      resp_json = None
+      data = None
+    return e.code, data, raw
+  except Exception as e:
+    return 0, None, str(e)
 
-  return code, resp_json, raw
 
-def _call_hostd(action: str, args: dict, wait: bool = True) -> tuple[int, dict]:
-  sock_path = os.environ.get("HOSTD_SOCK", "/hostd/hostd.sock")
-  path = "/v1/run?wait=1" if wait else "/v1/run"
-  payload = {"action": action, "args": args}
-  code, resp_json, raw = _unix_http_post_json(sock_path, path, payload, timeout_s=120.0)
+def _http_get_json(url: str, timeout_s: float = 10.0) -> tuple[int, dict | None, str]:
+  """GET JSON from vram-manager."""
+  req = urllib.request.Request(url, method="GET")
+  try:
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      raw = resp.read().decode("utf-8")
+      try:
+        data = json.loads(raw)
+      except json.JSONDecodeError:
+        data = None
+      return resp.status, data, raw
+  except urllib.error.HTTPError as e:
+    raw = e.read().decode("utf-8", errors="replace") if e.fp else ""
+    try:
+      data = json.loads(raw)
+    except Exception:
+      data = None
+    return e.code, data, raw
+  except Exception as e:
+    return 0, None, str(e)
 
-  if isinstance(resp_json, dict):
-    return code, resp_json
-
-  return code, {"ok": False, "error": "Invalid JSON from hostd", "raw": raw}
 
 routes = PromptServer.instance.routes
 
-STATE_FILE = os.environ.get("GPU_SHED_STATE_FILE", "/hostd/gpu-shed.stopped")
-
-def _read_shed_state() -> list[str]:
-  if not os.path.exists(STATE_FILE):
-    return []
-  try:
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-      lines = [ln.strip() for ln in f.readlines()]
-    return [ln for ln in lines if ln]
-  except Exception:
-    return []
 
 @routes.post("/spirit/vram/shed")
 async def spirit_vram_shed(request):
@@ -88,16 +76,32 @@ async def spirit_vram_shed(request):
   args = body.get("args") if isinstance(body.get("args"), dict) else {}
   protect = args.get("protect", "comfyui")
   high_only = bool(args.get("high_only", True))
-  quiet = bool(args.get("quiet", True))
   wait = bool(args.get("wait", True))
 
-  code, resp = _call_hostd("gpu_shed.shed", {
-    "protect": protect,
-    "high_only": high_only,
-    "quiet": quiet
-  }, wait=wait)
+  # Normalize protect to a list
+  if isinstance(protect, str):
+    protect_list = [c.strip() for c in protect.split(",") if c.strip()]
+  elif isinstance(protect, list):
+    protect_list = protect
+  else:
+    protect_list = ["comfyui"]
 
-  return web.json_response(resp, status=200 if code == 200 else 500)
+  payload = {
+    "protect": protect_list,
+    "high_only": high_only,
+  }
+
+  base_url = VRAM_MANAGER_URL.rstrip("/")
+  wait_param = "1" if wait else "0"
+  url = f"{base_url}/api/shed?wait={wait_param}"
+
+  code, resp_json, raw = _http_post_json(url, payload, timeout_s=120.0)
+
+  if isinstance(resp_json, dict):
+    return web.json_response(resp_json, status=200 if code == 200 else 500)
+
+  return web.json_response({"ok": False, "error": "Invalid response from vram-manager", "raw": raw}, status=500)
+
 
 @routes.post("/spirit/vram/restore")
 async def spirit_vram_restore(request):
@@ -107,28 +111,45 @@ async def spirit_vram_restore(request):
   except Exception:
     body = {}
 
+  payload = {}
+
+  base_url = VRAM_MANAGER_URL.rstrip("/")
   args = body.get("args") if isinstance(body.get("args"), dict) else {}
-  quiet = bool(args.get("quiet", True))
   wait = bool(args.get("wait", True))
+  wait_param = "1" if wait else "0"
+  url = f"{base_url}/api/restore?wait={wait_param}"
 
-  code, resp = _call_hostd("gpu_shed.restore", {
-    "quiet": quiet
-  }, wait=wait)
+  code, resp_json, raw = _http_post_json(url, payload, timeout_s=120.0)
 
-  return web.json_response(resp, status=200 if code == 200 else 500)
+  if isinstance(resp_json, dict):
+    return web.json_response(resp_json, status=200 if code == 200 else 500)
+
+  return web.json_response({"ok": False, "error": "Invalid response from vram-manager", "raw": raw}, status=500)
+
 
 @routes.get("/spirit/vram/status")
 async def spirit_vram_status(request):
-  stopped = _read_shed_state()
-  state_exists = os.path.exists(STATE_FILE)
+  base_url = VRAM_MANAGER_URL.rstrip("/")
+  url = f"{base_url}/api/status"
 
-  # restore is available if a shed state exists (even if no containers were stopped)
-  can_restore = state_exists
+  code, resp_json, raw = _http_get_json(url, timeout_s=10.0)
+
+  if code != 200 or not isinstance(resp_json, dict):
+    return web.json_response({
+      "can_restore": False,
+      "stopped_count": 0,
+      "stopped": [],
+      "error": f"vram-manager unreachable (code={code})",
+    }, status=200)
+
+  shed_state = resp_json.get("shed_state", [])
+  can_restore = len(shed_state) > 0
 
   return web.json_response({
     "can_restore": can_restore,
-    "stopped_count": len(stopped),
-    "stopped": stopped,
-    "state_file_exists": state_exists,
-    "state_file": STATE_FILE,
+    "stopped_count": len(shed_state),
+    "stopped": shed_state,
+    # Pass through the full status for the panel if needed
+    "gpu": resp_json.get("gpu"),
+    "consumers": resp_json.get("consumers"),
   }, status=200)
